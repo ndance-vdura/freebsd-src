@@ -64,6 +64,26 @@
 /* if_lagg(4) support */
 struct mbuf *(*lagg_input_infiniband_p)(struct ifnet *, struct mbuf *);
 
+/*
+ * Fix-up macros for handling BPF write. These are used to correct
+ * misinterpreted addresses within the BPF layer by correctly setting
+ * the MCAST and BCAST flags on an m_buf to match the header destination
+ * address.
+ */
+#define BPF_MBUF_FIXUP_REQUIRED(_hlen)                                        \
+	((_hlen) == ETHER_HDR_LEN)
+
+#define BPF_MBUF_FIXUP(_ifp, _mbuf) do {                                      \
+	struct infiniband_header *_ibh = mtod(_mbuf, struct infiniband_header *); \
+	(_mbuf)->m_flags &= ~(M_BCAST | M_MCAST);                                 \
+	if (memcmp(_ibh->ib_hwaddr, (_ifp)->if_broadcastaddr,                     \
+	        sizeof(_ibh->ib_hwaddr)) == 0) {                                  \
+	    (_mbuf)->m_flags |= M_BCAST;                                          \
+	} else if (INFINIBAND_IS_MULTICAST(_ibh->ib_hwaddr)) {                    \
+	    (_mbuf)->m_flags |= M_MCAST;                                          \
+	}                                                                         \
+} while (0)
+
 #ifdef INET
 static inline void
 infiniband_ipv4_multicast_map(uint32_t addr,
@@ -306,7 +326,7 @@ infiniband_output(struct ifnet *ifp, struct mbuf *m,
 	struct llentry *lle = NULL;
 	struct infiniband_header *ih;
 	int error = 0;
-	int hlen;	/* link layer header length */
+	int hlen  = 0;	/* link layer header length */
 	uint32_t pflags;
 	bool addref;
 
@@ -316,7 +336,7 @@ infiniband_output(struct ifnet *ifp, struct mbuf *m,
 	phdr = NULL;
 	pflags = 0;
 	if (ro != NULL) {
-		/* XXX BPF uses ro_prepend */
+		/* XXX BPF and ARP use ro_prepend */
 		if (ro->ro_prepend != NULL) {
 			phdr = ro->ro_prepend;
 			hlen = ro->ro_plen;
@@ -386,7 +406,7 @@ infiniband_output(struct ifnet *ifp, struct mbuf *m,
 	 * Add local infiniband header. If no space in first mbuf,
 	 * allocate another.
 	 */
-	M_PREPEND(m, INFINIBAND_HDR_LEN, M_NOWAIT);
+	M_PREPEND(m, hlen, M_NOWAIT);
 	if (m == NULL) {
 		error = ENOBUFS;
 		goto bad;
@@ -394,6 +414,14 @@ infiniband_output(struct ifnet *ifp, struct mbuf *m,
 	if ((pflags & RT_HAS_HEADER) == 0) {
 		ih = mtod(m, struct infiniband_header *);
 		memcpy(ih, phdr, hlen);
+	}
+
+	/*
+	 * MBUF flags may need correcting if frame was received from BPF.
+	 * Do this now that the header has been re-assembled
+	 */
+	if (BPF_MBUF_FIXUP_REQUIRED(hlen)) {
+		BPF_MBUF_FIXUP(ifp, m);
 	}
 
 	/*
